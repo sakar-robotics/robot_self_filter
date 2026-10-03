@@ -242,6 +242,11 @@ public:
   ConvexMesh(const shapes::Shape *shape);
   ~ConvexMesh() override = default;
 
+  // Uniform scale about the hull's centroid. Padding then moves every hull face out along its
+  // own normal, so an elongated link is padded as much along its sides as at its ends.
+  void setScale(double scale);
+  void setPadding(double padding);
+
   bool containsPoint(const tf2::Vector3 &p, bool verbose = false) const override;
   bool intersectsRay(const tf2::Vector3 &origin,
                      const tf2::Vector3 &dir,
@@ -251,17 +256,25 @@ public:
   void computeBoundingSphere(BoundingSphere &sphere) const override;
 
   const std::vector<unsigned int> &getTriangles() const { return m_triangles; }
+  // Hull vertices with scale and padding applied, for drawing the hull.
   const std::vector<tf2::Vector3> &getScaledVertices() const { return m_scaledVertices; }
 
 protected:
   void useDimensions(const shapes::Shape *shape) override;
   void updateInternalData() override;
+  // The pose-independent half of updateInternalData(): only scale and padding change it.
+  void updateScaledGeometry();
 
   bool isPointInsidePlanes(const tf2::Vector3 &point) const;
   unsigned int countVerticesBehindPlane(const Eigen::Vector4d &planeNormal) const;
 
+  double m_scale;
+  double m_padding;
+
   std::vector<Eigen::Vector4d> m_planes;
+  std::vector<Eigen::Vector4d> m_scaledPlanes;  // m_planes with scale and padding applied
   std::vector<tf2::Vector3>    m_vertices;
+  std::vector<tf2::Vector3>    m_vertexNormals;
   std::vector<tf2::Vector3>    m_scaledVertices;
   std::vector<unsigned int>    m_triangles;
   tf2::Transform               m_iPose;

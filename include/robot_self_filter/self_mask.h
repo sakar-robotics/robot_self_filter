@@ -477,7 +477,10 @@ protected:
             }
             case shapes::MESH:
             {
-              // Mesh scaling and padding are not currently configurable.
+              // single scale/padding, like a sphere or the box/cylinder fallback
+              auto mesh = dynamic_cast<bodies::ConvexMesh*>(sl.body);
+              mesh->setScale(linfo.scale);
+              mesh->setPadding(linfo.padding);
               break;
             }
             default:

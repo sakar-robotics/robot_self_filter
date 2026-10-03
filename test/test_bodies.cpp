@@ -234,6 +234,196 @@ TEST(Bodies, ConvexMeshContainsAndIntersectsCube)
   EXPECT_NEAR(hits.front().x(), 1.0, kTolerance);
 }
 
+// Bullet builds the hull in single precision.
+constexpr double kHullTolerance = 1e-6;
+
+std::unique_ptr<robot_self_filter::shapes::Mesh> makeBoxMesh(double hx, double hy, double hz)
+{
+  const std::vector<tf2::Vector3> vertices = {
+    {-hx, -hy, -hz}, {hx, -hy, -hz}, {hx, hy, -hz}, {-hx, hy, -hz},
+    {-hx, -hy, hz}, {hx, -hy, hz}, {hx, hy, hz}, {-hx, hy, hz}};
+  const std::vector<unsigned int> triangles = {
+    0, 2, 1, 0, 3, 2, 4, 5, 6, 4, 6, 7,
+    0, 1, 5, 0, 5, 4, 1, 2, 6, 1, 6, 5,
+    2, 3, 7, 2, 7, 6, 3, 0, 4, 3, 4, 7};
+  return std::unique_ptr<robot_self_filter::shapes::Mesh>(
+    robot_self_filter::shapes::createMeshFromVertices(vertices, triangles));
+}
+
+// What ConvexMesh::intersectsRay computed before it clipped the ray against the hull's
+// half-spaces: the nearest hull triangle in front of the origin (Moller-Trumbore).
+bool hullTrianglesIntersectRay(
+  const robot_self_filter::bodies::ConvexMesh &body,
+  const tf2::Vector3 &origin,
+  const tf2::Vector3 &direction,
+  double &t_first)
+{
+  const auto &vertices = body.getScaledVertices();
+  const auto &triangles = body.getTriangles();
+  t_first = std::numeric_limits<double>::infinity();
+  for (size_t i = 0; i + 2 < triangles.size(); i += 3)
+  {
+    const tf2::Vector3 a = body.getPose() * vertices[triangles[i]];
+    const tf2::Vector3 e1 = body.getPose() * vertices[triangles[i + 1]] - a;
+    const tf2::Vector3 e2 = body.getPose() * vertices[triangles[i + 2]] - a;
+    const tf2::Vector3 p = direction.cross(e2);
+    const double det = e1.dot(p);
+    if (std::fabs(det) < 1e-12)
+      continue;
+    const tf2::Vector3 s = origin - a;
+    const double u = s.dot(p) / det;
+    if (u < 0.0 || u > 1.0)
+      continue;
+    const tf2::Vector3 q = s.cross(e1);
+    const double v = direction.dot(q) / det;
+    if (v < 0.0 || u + v > 1.0)
+      continue;
+    const double t = e2.dot(q) / det;
+    if (t > 0.0)
+      t_first = std::min(t_first, t);
+  }
+  return std::isfinite(t_first);
+}
+
+TEST(Bodies, ConvexMeshPadsEveryFaceAlongItsNormal)
+{
+  // A long thin link. Padding the vertices radially from the centroid would pad its sides less
+  // and less towards its ends; moving the faces pads them evenly.
+  auto shape = makeBoxMesh(1.0, 0.1, 0.1);
+  ASSERT_NE(shape, nullptr);
+  robot_self_filter::bodies::ConvexMesh body(shape.get());
+  body.setPadding(0.05);
+
+  tf2::Quaternion rotation;
+  rotation.setRPY(0.0, 0.0, M_PI_2);  // long axis along world y, sides at world x 0.9..1.1
+  body.setPose(tf2::Transform(rotation, tf2::Vector3(1.0, 2.0, 0.0)));
+
+  // Side face, right next to the end of the link.
+  EXPECT_TRUE(body.containsPoint(tf2::Vector3(0.851, 2.9, 0.0)));
+  EXPECT_FALSE(body.containsPoint(tf2::Vector3(0.849, 2.9, 0.0)));
+  // End face.
+  EXPECT_TRUE(body.containsPoint(tf2::Vector3(1.0, 3.049, 0.0)));
+  EXPECT_FALSE(body.containsPoint(tf2::Vector3(1.0, 3.051, 0.0)));
+
+  std::vector<tf2::Vector3> hits;
+  ASSERT_TRUE(body.intersectsRay(
+    tf2::Vector3(-5.0, 2.9, 0.0), tf2::Vector3(1.0, 0.0, 0.0), &hits, 1));
+  ASSERT_EQ(hits.size(), 1U);
+  EXPECT_NEAR(hits[0].x(), 0.85, kHullTolerance);
+
+  // count 0 asks for every crossing: in through one padded side, out through the other.
+  hits.clear();
+  ASSERT_TRUE(body.intersectsRay(
+    tf2::Vector3(-5.0, 2.9, 0.0), tf2::Vector3(1.0, 0.0, 0.0), &hits, 0));
+  ASSERT_EQ(hits.size(), 2U);
+  EXPECT_NEAR(hits[0].x(), 0.85, kHullTolerance);
+  EXPECT_NEAR(hits[1].x(), 1.15, kHullTolerance);
+
+  // From inside there is only the way out.
+  hits.clear();
+  ASSERT_TRUE(body.intersectsRay(
+    tf2::Vector3(1.0, 2.9, 0.0), tf2::Vector3(1.0, 0.0, 0.0), &hits, 0));
+  ASSERT_EQ(hits.size(), 1U);
+  EXPECT_NEAR(hits[0].x(), 1.15, kHullTolerance);
+
+  // Pointing away from it, the hull is behind the ray.
+  EXPECT_FALSE(body.intersectsRay(
+    tf2::Vector3(1.5, 2.9, 0.0), tf2::Vector3(1.0, 0.0, 0.0), nullptr, 1));
+
+  robot_self_filter::bodies::BoundingSphere bound;
+  body.computeBoundingSphere(bound);
+  EXPECT_NEAR(bound.center.x(), 1.0, kHullTolerance);
+  EXPECT_NEAR(bound.center.y(), 2.0, kHullTolerance);
+  EXPECT_NEAR(bound.radius, std::sqrt(1.0 + 0.01 + 0.01) + 0.05, kHullTolerance);
+}
+
+TEST(Bodies, ConvexMeshScalesAboutItsCentroid)
+{
+  // A tetrahedron's centroid (0.5, 0.25, 0.25) is not its bounding box's centre (1, 0.5, 0.5), so
+  // scaling it about the centroid moves the hull out of a box that only grows about its centre.
+  const std::vector<tf2::Vector3> vertices = {
+    {0.0, 0.0, 0.0}, {2.0, 0.0, 0.0}, {0.0, 1.0, 0.0}, {0.0, 0.0, 1.0}};
+  std::unique_ptr<robot_self_filter::shapes::Mesh> shape(
+    robot_self_filter::shapes::createMeshFromVertices(
+      vertices, {0, 2, 1, 0, 1, 3, 0, 3, 2, 1, 2, 3}));
+  ASSERT_NE(shape, nullptr);
+  robot_self_filter::bodies::ConvexMesh body(shape.get());
+  body.setScale(2.0);
+  tf2::Transform pose;
+  pose.setIdentity();
+  body.setPose(pose);
+
+  // (1.8, 0.02, 0.02) and (0.05, 0.925, 0.025), both inside the original, scaled about the centroid.
+  EXPECT_TRUE(body.containsPoint(tf2::Vector3(3.1, -0.21, -0.21)));
+  EXPECT_TRUE(body.containsPoint(tf2::Vector3(-0.4, 1.6, -0.2)));
+  // Past the scaled tip at (3.5, -0.25, -0.25).
+  EXPECT_FALSE(body.containsPoint(tf2::Vector3(3.6, -0.2, -0.2)));
+  // Inside the scaled bounding box, outside the slanted face.
+  EXPECT_FALSE(body.containsPoint(tf2::Vector3(2.0, 1.0, 1.0)));
+
+  std::vector<tf2::Vector3> hits;
+  ASSERT_TRUE(body.intersectsRay(
+    tf2::Vector3(3.1, -5.0, -0.21), tf2::Vector3(0.0, 1.0, 0.0), &hits, 1));
+  ASSERT_EQ(hits.size(), 1U);
+  EXPECT_NEAR(hits[0].y(), -0.25, kHullTolerance);  // through the y = 0 face, scaled to -0.25
+}
+
+TEST(Bodies, ConvexMeshRayClippingMatchesHullTrianglesWhenUnpadded)
+{
+  std::uint32_t random_state = 0x5eed1234U;
+  std::vector<tf2::Vector3> vertices;  // read as a triangle soup, so a multiple of three
+  while (vertices.size() < 201U)
+  {
+    const tf2::Vector3 v(
+      randomRange(random_state, -1.0, 1.0),
+      randomRange(random_state, -1.0, 1.0),
+      randomRange(random_state, -1.0, 1.0));
+    if (v.length2() <= 1.0)
+      vertices.emplace_back(0.3 * v.x(), 0.1 * v.y(), 0.15 * v.z());
+  }
+  std::unique_ptr<robot_self_filter::shapes::Mesh> shape(
+    robot_self_filter::shapes::createMeshFromVertices(vertices));
+  ASSERT_NE(shape, nullptr);
+  robot_self_filter::bodies::ConvexMesh body(shape.get());
+  ASSERT_GT(body.getTriangles().size(), 3U * 20U);
+  tf2::Quaternion rotation;
+  rotation.setRPY(0.4, -0.3, 1.1);
+  body.setPose(tf2::Transform(rotation, tf2::Vector3(0.7, -0.2, 1.3)));
+
+  int hit_count = 0;
+  for (int sample = 0; sample < 20000; ++sample)
+  {
+    const tf2::Vector3 origin(
+      randomRange(random_state, 0.7 - 0.6, 0.7 + 0.6),
+      randomRange(random_state, -0.2 - 0.6, -0.2 + 0.6),
+      randomRange(random_state, 1.3 - 0.6, 1.3 + 0.6));
+    // Aimed around the hull, so rays hit, miss and graze it in comparable numbers.
+    const tf2::Vector3 target(
+      randomRange(random_state, 0.7 - 0.35, 0.7 + 0.35),
+      randomRange(random_state, -0.2 - 0.35, -0.2 + 0.35),
+      randomRange(random_state, 1.3 - 0.35, 1.3 + 0.35));
+    tf2::Vector3 direction = target - origin;
+    if (direction.length2() < 1e-12)
+      direction = tf2::Vector3(1.0, 0.0, 0.0);
+    direction.normalize();
+
+    double t_expected = 0.0;
+    const bool expected = hullTrianglesIntersectRay(body, origin, direction, t_expected);
+    std::vector<tf2::Vector3> hits;
+    ASSERT_EQ(body.intersectsRay(origin, direction, &hits, 1), expected) << "sample " << sample;
+    if (expected)
+    {
+      ++hit_count;
+      ASSERT_EQ(hits.size(), 1U) << "sample " << sample;
+      EXPECT_NEAR((hits[0] - origin).dot(direction), t_expected, kHullTolerance)
+        << "sample " << sample;
+    }
+  }
+  // Both outcomes are exercised.
+  EXPECT_GT(hit_count, 2000);
+  EXPECT_LT(hit_count, 18000);
+}
+
 TEST(Shapes, RejectsInvalidTriangleTopologyAndIndices)
 {
   const std::vector<tf2::Vector3> vertices = {
