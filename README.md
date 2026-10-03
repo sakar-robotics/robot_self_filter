@@ -21,7 +21,7 @@
 
 | | |
 | --- | --- |
-| **Sensor layouts** | Generic XYZ/XYZRGB, Ouster, Hesai, Robosense, and Pandar |
+| **Sensor layouts** | Generic XYZ/XYZRGB, Ouster, Hesai, Robosense, Pandar, and Livox Mid-360 |
 | **Collision geometry** | Sphere, box, cylinder, and convex mesh |
 | **Output modes** | Compact, organized, inverted, zero-filled, or NaN-filled |
 | **Debugging** | Optional collision-shape markers for RViz |
@@ -86,23 +86,8 @@ ros2 launch robot_self_filter self_filter.launch.py \
   use_sim_time:=false
 ```
 
-<<<<<<< Updated upstream
 > [!TIP]
 > Subscribe an RViz `MarkerArray` display to `/collision_shapes` while tuning padding. Marker construction is skipped when no subscriber is present.
-=======
-### Launch Parameters
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `robot_description` | string | - | Robot URDF/XACRO description |
-| `filter_config` | string | - | Path to YAML configuration file |
-| `in_pointcloud_topic` | string | `/cloud_in` | Input point cloud topic |
-| `out_pointcloud_topic` | string | `/cloud_out` | Filtered point cloud topic |
-| `lidar_sensor_type` | int | `0` | Sensor type (0: XYZ, 1: XYZRGB, 2: Ouster, 3: Hesai, 4: Robosense, 5: Pandar, 6: Livox Mid-360) |
-| `zero_for_removed_points` | bool | `true` | Set filtered points to zero instead of removing |
-| `use_sim_time` | bool | `true` | Use simulation time |
-| `description_name` | string | `/robot_description` | Robot description parameter namespace |
->>>>>>> Stashed changes
 
 ## Configuration
 
@@ -113,7 +98,7 @@ The filter reads collision geometry from `robot_description`. Global defaults ca
 | Sphere | scalar | scalar |
 | Box | `[x, y, z]` | `[x, y, z]` |
 | Cylinder | `[radial, axial]` | `[radial, axial]` |
-| Mesh | URDF geometry | Not configurable |
+| Mesh | scalar, about the hull's centroid | scalar, out along every hull face |
 
 ```yaml
 self_filter:
@@ -129,6 +114,10 @@ self_filter:
         box_padding: [0.03, 0.05, 0.08]
         shadow: false
 ```
+
+A mesh is filtered as the convex hull of its vertices, after the URDF's `<mesh scale>`. Like a
+sphere it takes the link's scalar `scale`/`padding`, whose defaults are `default_sphere_scale` and
+`default_sphere_padding`; boxes and cylinders without per-link vectors fall back to the same two.
 
 `shadow` defaults to `true`. Set it to `false` when coarse collision geometry touches the
 sensor aperture and should still reject contained robot points without removing terrain rays
@@ -168,6 +157,11 @@ These are node defaults. The supplied launch file overrides some of them as show
 | `publish_collision_shapes` | `true` | Publish markers when a subscriber exists |
 | `self_see_links.names` | `[]` | URDF links included in the self mask |
 | `self_see_links.<link>.shadow` | `true` | Reject rays intersecting this link; containment filtering is always active |
+| `qos_overrides./<out topic>.publisher.reliability` | `best_effort` | Also `history` / `depth`; set `reliable` for RELIABLE-only subscribers |
+
+A link takes no part in the mask until its first transform arrives, and the node warns which one
+is waiting. Until then it would sit at the cloud frame's origin, on top of the sensor, where its
+shadow would swallow every ray.
 
 </details>
 
@@ -181,6 +175,7 @@ These are node defaults. The supplied launch file overrides some of them as show
 | `3` | Hesai | `PointHesai` |
 | `4` | Robosense | `PointRobosense` |
 | `5` | Pandar | `PointPandar` |
+| `6` | Livox Mid-360 (`livox_ros_driver2` PointXYZRTLT) | `PointLivoxMid360` |
 
 ## Interfaces
 
@@ -189,7 +184,7 @@ These are node defaults. The supplied launch file overrides some of them as show
 | Subscribe | `/cloud_in` | `sensor_msgs/msg/PointCloud2` | Sensor data QoS; remappable |
 | Subscribe | `/tf` | `tf2_msgs/msg/TFMessage` | Dynamic link transforms |
 | Subscribe | `/tf_static` | `tf2_msgs/msg/TFMessage` | Static link transforms |
-| Publish | `/cloud_out` | `sensor_msgs/msg/PointCloud2` | Filtered cloud, sensor data QoS |
+| Publish | `/cloud_out` | `sensor_msgs/msg/PointCloud2` | Filtered cloud, sensor data QoS unless overridden |
 | Publish | `/collision_shapes` | `visualization_msgs/msg/MarkerArray` | Optional debug geometry |
 
 ## Tuning workflow
@@ -203,25 +198,14 @@ These are node defaults. The supplied launch file overrides some of them as show
 <details>
 <summary><strong>Troubleshooting</strong></summary>
 
-<<<<<<< Updated upstream
 | Symptom | Checks |
 | --- | --- |
 | Robot points remain | Check `sensor_frame`, TF connectivity, collision geometry, and link names; then increase padding carefully |
 | Environment points disappear | Reduce padding/scale and verify `min_sensor_dist` |
 | No output cloud | Confirm the input topic, remappings, `robot_description`, and YAML node key (`self_filter`) |
+| No subscriber receives the cloud | A RELIABLE-only subscriber cannot match the default BEST_EFFORT output; override `qos_overrides.<topic>.publisher.reliability` |
 | High CPU usage | Reduce filtered links, simplify collision meshes, and disable unused marker subscriptions |
 | Organized output looks invalid | Check `keep_organized` together with `zero_for_removed_points` |
-=======
-| Value | Sensor Type | Point Type |
-|-------|-------------|------------|
-| 0 | Generic XYZ | `pcl::PointXYZ` |
-| 1 | Generic XYZRGB | `pcl::PointXYZRGB` |
-| 2 | Ouster | Custom Ouster point type |
-| 3 | Hesai | Custom Hesai point type |
-| 4 | Robosense | Custom Robosense point type |
-| 5 | Pandar | Custom Pandar point type |
-| 6 | Livox Mid-360 | PointXYZRTLT (`x`, `y`, `z`, `intensity`, `tag`, `line`, `timestamp`) |
->>>>>>> Stashed changes
 
 </details>
 
@@ -258,15 +242,4 @@ Bug reports and focused pull requests are welcome. Please include a regression t
 
 Licensed under the [BSD 3-Clause License](LICENSE).
 
-<<<<<<< Updated upstream
 ROS 2 port and maintenance by [Lorenzo Terenzi](mailto:lterenzi@ethz.ch). Original ROS 1 implementation by Eitan Marder-Eppstein and contributors.
-=======
-## Maintainer
-
-Lorenzo Terenzi <lterenzi@ethz.ch>
-
-## Author
-
-ROS 2 version by Lorenzo Terenzi
-Original ROS 1 version by Eitan Marder-Eppstein
->>>>>>> Stashed changes
