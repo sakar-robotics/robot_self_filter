@@ -1,7 +1,11 @@
 #include <gtest/gtest.h>
 
+#include <unistd.h>
+
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <fstream>
 #include <limits>
 #include <memory>
 #include <string>
@@ -221,6 +225,67 @@ TEST(SelfMask, UsesPrefixedNameForTfAndSuffixForUrdfLookup)
   mask.maskContainment(cloud, result);
   ASSERT_EQ(result.size(), 1U);
   EXPECT_EQ(result[0], robot_self_filter::INSIDE);
+}
+
+// A binary STL of a cube centred on the origin.
+std::string writeCubeStl(const std::string &name, const float half)
+{
+  const float h = half;
+  const float corners[8][3] = {
+    {-h, -h, -h}, {h, -h, -h}, {h, h, -h}, {-h, h, -h},
+    {-h, -h, h}, {h, -h, h}, {h, h, h}, {-h, h, h}};
+  const unsigned int faces[12][3] = {
+    {0, 2, 1}, {0, 3, 2}, {4, 5, 6}, {4, 6, 7}, {0, 1, 5}, {0, 5, 4},
+    {1, 2, 6}, {1, 6, 5}, {2, 3, 7}, {2, 7, 6}, {3, 0, 4}, {3, 4, 7}};
+  const std::string path =
+    testing::TempDir() + name + "_" + std::to_string(::getpid()) + ".stl";
+  std::ofstream out(path, std::ios::binary);
+  const char header[80] = {};
+  out.write(header, sizeof(header));
+  const std::uint32_t count = 12U;
+  out.write(reinterpret_cast<const char *>(&count), sizeof(count));
+  for (const auto &face : faces)
+  {
+    const float normal[3] = {0.0F, 0.0F, 0.0F};  // the loader recomputes them
+    out.write(reinterpret_cast<const char *>(normal), sizeof(normal));
+    for (const unsigned int corner : face)
+      out.write(reinterpret_cast<const char *>(corners[corner]), sizeof(corners[corner]));
+    const std::uint16_t attribute = 0U;
+    out.write(reinterpret_cast<const char *>(&attribute), sizeof(attribute));
+  }
+  return path;
+}
+
+TEST(SelfMask, PadsMeshLinksAndAppliesTheirUrdfScale)
+{
+  // Modelled in millimetres, as CAD exports often are: a 1 m cube once <mesh scale> applies.
+  const std::string stl = writeCubeStl("self_mask_mesh_cube", 500.0F);
+  auto node = std::make_shared<rclcpp::Node>(uniqueNodeName("self_mask_mesh"));
+  node->declare_parameter<std::string>("robot_description",
+    "<robot name=\"mesh_robot\"><link name=\"robot\"><collision><geometry>"
+    "<mesh filename=\"file://" + stl + "\" scale=\"0.001 0.001 0.001\"/>"
+    "</geometry></collision></link></robot>");
+  tf2_ros::Buffer buffer(node->get_clock());
+  buffer.setUsingDedicatedThread(true);
+  robot_self_filter::LinkInfo link;
+  link.name = "robot";
+  link.scale = 1.0;
+  link.padding = 0.05;
+  robot_self_filter::SelfMask<pcl::PointXYZ> mask(node, buffer, {link});
+  std::remove(stl.c_str());
+
+  pcl::PointCloud<pcl::PointXYZ> cloud;
+  cloud.header.frame_id = "robot";
+  cloud.points = {
+    pcl::PointXYZ(0.54F, 0.0F, 0.0F),    // inside the padding
+    pcl::PointXYZ(0.56F, 0.0F, 0.0F),    // just past it
+    pcl::PointXYZ(0.0F, 0.0F, 400.0F)};  // inside only if the scale were dropped
+  cloud.width = 3;
+  cloud.height = 1;
+  std::vector<int> result;
+  mask.maskContainment(cloud, result);
+  EXPECT_EQ(result, std::vector<int>({
+    robot_self_filter::INSIDE, robot_self_filter::OUTSIDE, robot_self_filter::OUTSIDE}));
 }
 
 TEST(SelfFilterOutput, UnorganizedNormalAndInvertedModesPreserveSelectedPoints)

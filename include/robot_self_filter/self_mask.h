@@ -114,6 +114,17 @@ static shapes::Shape* constructShape(const urdf::Geometry *geom)
               "Mesh resource is too large for the STL loader: %zu bytes", res.size);
         }
       }
+      // <mesh scale> is part of the geometry, e.g. 0.001 for a mesh modelled in millimetres.
+      if (result)
+      {
+        auto *loaded = static_cast<shapes::Mesh*>(result);
+        for (unsigned int i = 0; i < loaded->vertexCount; ++i)
+        {
+          loaded->vertices[3 * i]     *= mesh->scale.x;
+          loaded->vertices[3 * i + 1] *= mesh->scale.y;
+          loaded->vertices[3 * i + 2] *= mesh->scale.z;
+        }
+      }
       break;
     }
     default:
@@ -416,7 +427,13 @@ protected:
       for (auto &coll : collisions)
       {
         shapes::Shape *shape = constructShape(coll->geometry.get());
-        if (!shape) continue;
+        if (!shape)
+        {
+          RCLCPP_WARN(node_->get_logger(),
+            "Self-filter link '%s' has collision geometry that could not be loaded",
+            urdf_link_name.c_str());
+          continue;
+        }
 
         SeeLink sl;
         sl.name       = linfo.name;
