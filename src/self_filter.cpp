@@ -70,10 +70,15 @@ namespace robot_self_filter
       RCLCPP_INFO(this->get_logger(), "  publish_collision_shapes: %s",
                   publish_collision_shapes_ ? "true" : "false");
 
-      // Publish filtered cloud as sensor data QoS (BEST_EFFORT) for high-rate streams
+      // Publish filtered cloud as sensor data QoS (BEST_EFFORT) for high-rate streams.
+      // qos_overrides.<topic>.publisher.{reliability,history,depth} can change it, e.g. to
+      // RELIABLE for consumers that only subscribe RELIABLE and would otherwise match nothing.
+      rclcpp::PublisherOptions cloud_options;
+      cloud_options.qos_overriding_options =
+          rclcpp::QosOverridingOptions::with_default_policies();
       pointCloudPublisher_ =
           this->create_publisher<sensor_msgs::msg::PointCloud2>(
-              "cloud_out", rclcpp::SensorDataQoS());
+              "cloud_out", rclcpp::SensorDataQoS(), cloud_options);
 
       marker_pub_ =
           this->create_publisher<visualization_msgs::msg::MarkerArray>("collision_shapes", 1);
