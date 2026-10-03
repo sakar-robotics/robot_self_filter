@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <fstream>
 #include <limits>
 #include <memory>
@@ -15,10 +16,13 @@
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
 #include <rclcpp/rclcpp.hpp>
+#include <sensor_msgs/msg/point_cloud2.hpp>
+#include <sensor_msgs/point_cloud2_iterator.hpp>
 #include <tf2/LinearMath/Vector3.h>
 #include <tf2_ros/buffer.h>
 
 #include "robot_self_filter/point_hesai.h"
+#include "robot_self_filter/point_livox_mid360.h"
 #include "robot_self_filter/point_ouster.h"
 #include "robot_self_filter/point_pandar.h"
 #include "robot_self_filter/point_robosense.h"
@@ -469,6 +473,81 @@ TEST(SelfFilterOutput, PreservesRobosensePointLayout)
 TEST(SelfFilterOutput, PreservesPandarPointLayout)
 {
   expectCustomPointLayoutIsPreserved<PointPandar>();
+}
+
+TEST(SelfFilterOutput, LivoxMid360KeepsEveryFieldOfTheDriversCloud)
+{
+  // livox_ros_driver2's PointCloud2 (xfer_format 0): packed, so 26 bytes a point and the
+  // timestamp unaligned at 18.
+  using sensor_msgs::msg::PointField;
+  struct Field
+  {
+    const char *name;
+    std::uint32_t offset;
+    std::uint8_t datatype;
+  };
+  const Field fields[] = {
+    {"x", 0U, PointField::FLOAT32}, {"y", 4U, PointField::FLOAT32},
+    {"z", 8U, PointField::FLOAT32}, {"intensity", 12U, PointField::FLOAT32},
+    {"tag", 16U, PointField::UINT8}, {"line", 17U, PointField::UINT8},
+    {"timestamp", 18U, PointField::FLOAT64}};
+  auto cloud = std::make_shared<sensor_msgs::msg::PointCloud2>();
+  cloud->header.frame_id = "robot";
+  for (const Field &field : fields)
+  {
+    PointField point_field;
+    point_field.name = field.name;
+    point_field.offset = field.offset;
+    point_field.datatype = field.datatype;
+    point_field.count = 1;
+    cloud->fields.push_back(point_field);
+  }
+  cloud->height = 1;
+  cloud->width = 2;
+  cloud->point_step = 26;
+  cloud->row_step = cloud->point_step * cloud->width;
+  cloud->is_dense = true;
+  cloud->data.resize(cloud->row_step);
+  const auto write = [&cloud](std::size_t point, std::uint32_t offset, const auto value)
+  {
+    std::memcpy(cloud->data.data() + point * cloud->point_step + offset, &value, sizeof(value));
+  };
+  for (std::size_t i = 0; i < 2; ++i)
+  {
+    const float k = static_cast<float>(i);
+    write(i, 0U, 1.0F + 3.0F * k);
+    write(i, 4U, 2.0F + 3.0F * k);
+    write(i, 8U, 3.0F + 3.0F * k);
+    write(i, 12U, 40.0F * (k + 1.0F));
+    write(i, 16U, static_cast<std::uint8_t>(0x12 + i));
+    write(i, 17U, static_cast<std::uint8_t>(3 - i));
+    write(i, 18U, 1.5e6 + 1.0e6 * static_cast<double>(i));
+  }
+
+  auto node = makeNode("livox_mid360_round_trip");
+  filters::SelfFilter<PointLivoxMid360> filter(node);  // no self_see_links: every point stays
+  sensor_msgs::msg::PointCloud2 out;
+  int input_size = 0;
+  int output_size = 0;
+  ASSERT_TRUE(filter.fillPointCloud2(cloud, "", out, input_size, output_size));
+  ASSERT_EQ(output_size, 2);
+
+  sensor_msgs::PointCloud2ConstIterator<float> x(out, "x");
+  sensor_msgs::PointCloud2ConstIterator<float> z(out, "z");
+  sensor_msgs::PointCloud2ConstIterator<float> intensity(out, "intensity");
+  sensor_msgs::PointCloud2ConstIterator<std::uint8_t> tag(out, "tag");
+  sensor_msgs::PointCloud2ConstIterator<std::uint8_t> line(out, "line");
+  sensor_msgs::PointCloud2ConstIterator<double> timestamp(out, "timestamp");
+  for (std::size_t i = 0; i < 2; ++i, ++x, ++z, ++intensity, ++tag, ++line, ++timestamp)
+  {
+    const float k = static_cast<float>(i);
+    EXPECT_FLOAT_EQ(*x, 1.0F + 3.0F * k);
+    EXPECT_FLOAT_EQ(*z, 3.0F + 3.0F * k);
+    EXPECT_FLOAT_EQ(*intensity, 40.0F * (k + 1.0F));
+    EXPECT_EQ(static_cast<unsigned>(*tag), 0x12U + i);
+    EXPECT_EQ(static_cast<unsigned>(*line), 3U - i);
+    EXPECT_DOUBLE_EQ(*timestamp, 1.5e6 + 1.0e6 * static_cast<double>(i));
+  }
 }
 
 }  // namespace
