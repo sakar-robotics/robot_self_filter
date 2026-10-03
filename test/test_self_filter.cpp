@@ -11,6 +11,7 @@
 #include <string>
 #include <vector>
 
+#include <geometry_msgs/msg/transform_stamped.hpp>
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
 #include <rclcpp/rclcpp.hpp>
@@ -286,6 +287,47 @@ TEST(SelfMask, PadsMeshLinksAndAppliesTheirUrdfScale)
   mask.maskContainment(cloud, result);
   EXPECT_EQ(result, std::vector<int>({
     robot_self_filter::INSIDE, robot_self_filter::OUTSIDE, robot_self_filter::OUTSIDE}));
+}
+
+TEST(SelfMask, IgnoresABodyUntilItsTransformArrives)
+{
+  auto node = std::make_shared<rclcpp::Node>(uniqueNodeName("self_mask_unposed"));
+  node->declare_parameter<std::string>("robot_description",
+    "<robot name=\"arm_robot\"><link name=\"arm\"><collision><geometry>"
+    "<box size=\"1 1 1\"/></geometry></collision></link></robot>");
+  tf2_ros::Buffer buffer(node->get_clock());
+  buffer.setUsingDedicatedThread(true);
+  robot_self_filter::LinkInfo link;
+  link.name = "arm";
+  link.padding = 0.0;
+  robot_self_filter::SelfMask<pcl::PointXYZ> mask(node, buffer, {link});
+
+  pcl::PointCloud<pcl::PointXYZ> cloud;
+  cloud.header.frame_id = "sensor";
+  cloud.points = {
+    pcl::PointXYZ(0.2F, 0.0F, 0.0F),
+    pcl::PointXYZ(5.0F, 0.0F, 0.0F),
+    pcl::PointXYZ(10.0F, 0.0F, 0.0F),
+    pcl::PointXYZ(15.0F, 0.0F, 0.0F)};
+  cloud.width = 4;
+  cloud.height = 1;
+
+  // No sensor -> arm transform yet. Left at the cloud origin, the box would contain the first
+  // point and shadow every other one, since every ray ends at the sensor inside it.
+  std::vector<int> result;
+  mask.maskIntersection(cloud, tf2::Vector3(0.0, 0.0, 0.0), 0.0, result);
+  EXPECT_EQ(result, std::vector<int>(4, robot_self_filter::OUTSIDE));
+
+  geometry_msgs::msg::TransformStamped arm;
+  arm.header.frame_id = "sensor";
+  arm.child_frame_id = "arm";
+  arm.transform.translation.x = 10.0;
+  arm.transform.rotation.w = 1.0;
+  buffer.setTransform(arm, "test", true);
+  mask.maskIntersection(cloud, tf2::Vector3(0.0, 0.0, 0.0), 0.0, result);
+  EXPECT_EQ(result, std::vector<int>({
+    robot_self_filter::OUTSIDE, robot_self_filter::OUTSIDE,
+    robot_self_filter::INSIDE, robot_self_filter::SHADOW}));
 }
 
 TEST(SelfFilterOutput, UnorganizedNormalAndInvertedModesPreserveSelectedPoints)
