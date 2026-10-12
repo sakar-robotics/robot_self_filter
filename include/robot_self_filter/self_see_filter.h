@@ -2,6 +2,7 @@
 #ifndef FILTERS_SELF_SEE_H_
 #define FILTERS_SELF_SEE_H_
 
+#include <algorithm>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -11,6 +12,7 @@
 #include <tf2_ros/buffer.h>
 #include <tf2_ros/transform_listener.h>
 #include <pcl_conversions/pcl_conversions.h>
+#include <pcl/common/io.h>
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
 #include <filters/filter_base.hpp>
@@ -147,6 +149,7 @@ public:
                        int &input_size,
                        int &output_size) override
   {
+    warnMissingFieldsOnce(*cloud2);
     typename pcl::PointCloud<PointT>::Ptr cloud(new pcl::PointCloud<PointT>);
     pcl::fromROSMsg(*cloud2, *cloud);
 
@@ -168,6 +171,28 @@ public:
   }
 
 protected:
+  // PCL warns on every cloud for each field of PointT the cloud lacks (the node silences that, see
+  // main()); say it once here instead. The missing fields are left zero in the output.
+  void warnMissingFieldsOnce(const sensor_msgs::msg::PointCloud2 &cloud2)
+  {
+    if (fields_checked_) return;
+    fields_checked_ = true;
+
+    std::string missing;
+    for (const auto &field : pcl::getFields<PointT>())
+    {
+      const bool found = std::any_of(cloud2.fields.begin(), cloud2.fields.end(),
+        [&field](const sensor_msgs::msg::PointField &f) { return f.name == field.name; });
+      if (!found) missing += (missing.empty() ? "" : ", ") + field.name;
+    }
+    if (!missing.empty())
+    {
+      RCLCPP_WARN(node_->get_logger(),
+        "Input cloud has no field(s) %s for this lidar_sensor_type; they are zero in the output",
+        missing.c_str());
+    }
+  }
+
   bool update(const PointCloud &data_in, PointCloud &data_out) override
   {
     std::vector<int> keep(data_in.points.size(), 0);
@@ -254,6 +279,7 @@ protected:
   double default_sphere_pad_ = 0.01;
 
   std::string sensor_frame_;
+  bool fields_checked_ = false;
 };
 
 }  // namespace filters

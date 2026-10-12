@@ -4,6 +4,7 @@
 #include <sstream>
 #include <memory>
 
+#include <pcl/console/print.h>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <std_msgs/msg/header.hpp>
@@ -361,6 +362,9 @@ namespace robot_self_filter
 int main(int argc, char **argv)
 {
   rclcpp::init(argc, argv);
+  // pcl::fromROSMsg warns on every cloud for each missing field (e.g. a simulated lidar without
+  // the Livox tag/line/timestamp); SelfFilter reports those once instead.
+  pcl::console::setVerbosityLevel(pcl::console::L_ERROR);
   auto node = std::make_shared<robot_self_filter::SelfFilterNode>();
   node->initSelfFilter();
   rclcpp::spin(node);
