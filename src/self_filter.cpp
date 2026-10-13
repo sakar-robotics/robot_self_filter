@@ -4,6 +4,7 @@
 #include <sstream>
 #include <memory>
 
+#include <pcl/console/print.h>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <std_msgs/msg/header.hpp>
@@ -12,6 +13,7 @@
 #include "robot_self_filter/self_see_filter.h"
 #include "robot_self_filter/point_ouster.h"
 #include "robot_self_filter/point_hesai.h"
+#include "robot_self_filter/point_livox_mid360.h"
 #include "robot_self_filter/point_pandar.h"
 #include "robot_self_filter/point_robosense.h"
 
@@ -29,6 +31,7 @@ namespace robot_self_filter
     HesaiSensor = 3,
     RobosenseSensor = 4,
     PandarSensor = 5,
+    LivoxMid360Sensor = 6,
   };
 
   class SelfFilterNode : public rclcpp::Node
@@ -68,10 +71,15 @@ namespace robot_self_filter
       RCLCPP_INFO(this->get_logger(), "  publish_collision_shapes: %s",
                   publish_collision_shapes_ ? "true" : "false");
 
-      // Publish filtered cloud as sensor data QoS (BEST_EFFORT) for high-rate streams
+      // Publish filtered cloud as sensor data QoS (BEST_EFFORT) for high-rate streams.
+      // qos_overrides.<topic>.publisher.{reliability,history,depth} can change it, e.g. to
+      // RELIABLE for consumers that only subscribe RELIABLE and would otherwise match nothing.
+      rclcpp::PublisherOptions cloud_options;
+      cloud_options.qos_overriding_options =
+          rclcpp::QosOverridingOptions::with_default_policies();
       pointCloudPublisher_ =
           this->create_publisher<sensor_msgs::msg::PointCloud2>(
-              "cloud_out", rclcpp::SensorDataQoS());
+              "cloud_out", rclcpp::SensorDataQoS(), cloud_options);
 
       marker_pub_ =
           this->create_publisher<visualization_msgs::msg::MarkerArray>("collision_shapes", 1);
@@ -98,6 +106,9 @@ namespace robot_self_filter
         break;
       case SensorType::PandarSensor:
         self_filter_ = std::make_shared<filters::SelfFilter<PointPandar>>(this->shared_from_this());
+        break;
+      case SensorType::LivoxMid360Sensor:
+        self_filter_ = std::make_shared<filters::SelfFilter<PointLivoxMid360>>(this->shared_from_this());
         break;
       default:
         RCLCPP_WARN(this->get_logger(),
@@ -191,6 +202,14 @@ namespace robot_self_filter
         if (!filter)
           return;
         publishShapesFromMask(filter->getSelfMaskPtr(), cloud->header);
+        break;
+      }
+      case SensorType::LivoxMid360Sensor:
+      {
+        auto sf_livox = std::dynamic_pointer_cast<filters::SelfFilter<PointLivoxMid360>>(self_filter_);
+        if (!sf_livox)
+          return;
+        publishShapesFromMask(sf_livox->getSelfMaskPtr(), cloud->header);
         break;
       }
       default:
@@ -343,6 +362,9 @@ namespace robot_self_filter
 int main(int argc, char **argv)
 {
   rclcpp::init(argc, argv);
+  // pcl::fromROSMsg warns on every cloud for each missing field (e.g. a simulated lidar without
+  // the Livox tag/line/timestamp); SelfFilter reports those once instead.
+  pcl::console::setVerbosityLevel(pcl::console::L_ERROR);
   auto node = std::make_shared<robot_self_filter::SelfFilterNode>();
   node->initSelfFilter();
   rclcpp::spin(node);

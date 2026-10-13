@@ -402,86 +402,80 @@ bool Box::intersectsRay(const tf2::Vector3 &origin,
   return true;
 }
 
-// ConvexMesh (unchanged except for normal scale/padding usage)
+// ConvexMesh
 ConvexMesh::ConvexMesh() : Body()
 {
-  m_type       = shapes::MESH;
-  m_radiusB    = 0.0;
-  m_radiusBSqr = 0.0;
+  m_type        = shapes::MESH;
+  m_scale       = 1.0;
+  m_padding     = 0.0;
+  m_meshRadiusB = 0.0;
+  m_radiusB     = 0.0;
+  m_radiusBSqr  = 0.0;
 }
 ConvexMesh::ConvexMesh(const shapes::Shape *shape) : ConvexMesh()
 {
   setDimensions(shape);
 }
+void ConvexMesh::setScale(double scale)
+{
+  m_scale = scale;
+  updateScaledGeometry();
+  updateInternalData();
+}
+void ConvexMesh::setPadding(double padding)
+{
+  m_padding = padding;
+  updateScaledGeometry();
+  updateInternalData();
+}
 bool ConvexMesh::containsPoint(const tf2::Vector3 &p, bool) const
 {
   if (!m_boundingBox.containsPoint(p)) return false;
-  tf2::Vector3 ip = m_iPose * p;
-  ip = m_meshCenter + (ip - m_meshCenter); // uniform scale/padding can be applied if desired
-  return isPointInsidePlanes(ip);
+  return isPointInsidePlanes(m_iPose * p);
 }
 bool ConvexMesh::intersectsRay(const tf2::Vector3 &origin,
                                const tf2::Vector3 &dir,
                                std::vector<tf2::Vector3> *intersections,
                                unsigned int count) const
 {
+  if (m_scaledPlanes.empty()) return false;
   if (distanceSQR(m_center, origin, dir) > m_radiusBSqr) return false;
   if (!m_boundingBox.intersectsRay(origin, dir)) return false;
 
-  tf2::Vector3 orig = m_iPose * origin;
-  tf2::Matrix3x3 rot(m_iPose.getBasis());
-  tf2::Vector3 dr = rot * dir;
-
-  std::vector<detail::intersc> ipts;
-  bool result = false;
-  const size_t nt = m_triangles.size() / 3;
-  for (size_t i = 0; i < nt; ++i)
+  // The hull is the intersection of its faces' half-spaces, so the ray is inside it from the
+  // last face it enters through to the first face it leaves through.
+  const tf2::Vector3 orig = m_iPose * origin;
+  const tf2::Vector3 dr = tf2::Matrix3x3(m_iPose.getBasis()) * dir;
+  double t_near = -std::numeric_limits<double>::infinity();
+  double t_far  = std::numeric_limits<double>::infinity();
+  for (const Eigen::Vector4d &plane : m_scaledPlanes)
   {
-    const Eigen::Vector4d &plane = m_planes[i];
-    double denom = plane(0)*dr.x() + plane(1)*dr.y() + plane(2)*dr.z();
-    if (std::fabs(denom) < 1e-9) continue;
-    double numer = -(plane(0)*orig.x() + plane(1)*orig.y() + plane(2)*orig.z() + plane(3));
-    double t = numer / denom;
-    if (t > 0.0)
+    const double dist  = plane(0)*orig.x() + plane(1)*orig.y() + plane(2)*orig.z() + plane(3);
+    const double denom = plane(0)*dr.x() + plane(1)*dr.y() + plane(2)*dr.z();
+    if (std::fabs(denom) < ZERO)
     {
-      const unsigned int v1 = m_triangles[3*i+0];
-      const unsigned int v2 = m_triangles[3*i+1];
-      const unsigned int v3 = m_triangles[3*i+2];
-      const tf2::Vector3 &a = m_scaledVertices[v1];
-      const tf2::Vector3 &b = m_scaledVertices[v2];
-      const tf2::Vector3 &c = m_scaledVertices[v3];
-      tf2::Vector3 P = orig + dr * t;
-
-      tf2::Vector3 cb = c - b;
-      tf2::Vector3 ab = a - b;
-      tf2::Vector3 pb = P - b;
-      tf2::Vector3 c1 = cb.cross(pb);
-      tf2::Vector3 c2 = cb.cross(ab);
-      if (c1.dot(c2) < 0.0) continue;
-      tf2::Vector3 ca = c - a;
-      tf2::Vector3 pa = P - a;
-      tf2::Vector3 ba = -ab;
-      c1 = ca.cross(pa);
-      c2 = ca.cross(ba);
-      if (c1.dot(c2) < 0.0) continue;
-      c1 = ba.cross(pa);
-      c2 = ba.cross(ca);
-      if (c1.dot(c2) < 0.0) continue;
-
-      result = true;
-      if (!intersections) break;
-      ipts.emplace_back(origin + dir * t, t);
+      if (dist > 0.0) return false;  // parallel to this face, on its outer side
+      continue;
     }
+    const double t = -dist / denom;
+    if (denom < 0.0)
+      t_near = std::max(t_near, t);
+    else
+      t_far = std::min(t_far, t);
+    if (t_near > t_far) return false;
   }
-  if (intersections && !ipts.empty())
+  if (t_far <= 0.0) return false;  // the hull is behind the origin
+
+  if (intersections)
   {
-    std::sort(ipts.begin(), ipts.end(), detail::interscOrder());
-    const size_t n = count > 0 ?
-      std::min(static_cast<size_t>(count), ipts.size()) : ipts.size();
-    for (size_t i = 0; i < n; ++i)
-      intersections->push_back(ipts[i].pt);
+    // From outside the ray meets the hull twice, unless it only grazes it; from inside, once.
+    const bool enters = t_near > 0.0 && (t_far - t_near) > ZERO;
+    if (enters)
+      intersections->push_back(origin + dir * t_near);
+    if (!enters || count != 1)
+      intersections->push_back(origin + dir * t_far);
   }
-  return result;
+  return true;
 }
 double ConvexMesh::computeVolume() const
 {
@@ -528,6 +522,7 @@ void ConvexMesh::useDimensions(const shapes::Shape *shape)
   m_planes.clear(); 
   m_triangles.clear(); 
   m_vertices.clear();
+  m_vertexNormals.clear();
   m_meshRadiusB = 0.0; 
   m_meshCenter.setValue(0,0,0);
 
@@ -597,6 +592,17 @@ void ConvexMesh::useDimensions(const shapes::Shape *shape)
         m_triangles.push_back(i2);
       }
     }
+
+    // Only for drawing the padded hull; the filter itself pads the planes, not the vertices.
+    m_vertexNormals.assign(m_vertices.size(), tf2::Vector3(0.0, 0.0, 0.0));
+    for (size_t i = 0; i < m_planes.size(); ++i)
+    {
+      const tf2::Vector3 normal(m_planes[i](0), m_planes[i](1), m_planes[i](2));
+      for (size_t k = 0; k < 3; ++k)
+        m_vertexNormals[m_triangles[3 * i + k]] += normal;
+    }
+    for (auto &normal : m_vertexNormals)
+      if (normal.length2() > 0.0) normal.normalize();
   }
   else
   {
@@ -604,28 +610,44 @@ void ConvexMesh::useDimensions(const shapes::Shape *shape)
   }
   hl.ReleaseResult(hr);
   delete[] vertices;
+  updateScaledGeometry();
+}
+void ConvexMesh::updateScaledGeometry()
+{
+  // Scaling about the centroid c takes face n.x + d = 0 to n.x + s*d + (s - 1)*n.c = 0, and the
+  // padding then pushes it out along its unit normal n.
+  m_scaledPlanes.resize(m_planes.size());
+  for (size_t i = 0; i < m_planes.size(); ++i)
+  {
+    const Eigen::Vector4d &plane = m_planes[i];
+    const double n_dot_c = plane(0) * m_meshCenter.x() + plane(1) * m_meshCenter.y() +
+      plane(2) * m_meshCenter.z();
+    m_scaledPlanes[i] = plane;
+    m_scaledPlanes[i](3) = m_scale * plane(3) + (m_scale - 1.0) * n_dot_c - m_padding;
+  }
+
+  m_scaledVertices.resize(m_vertices.size());
+  for (size_t i = 0; i < m_vertices.size(); ++i)
+    m_scaledVertices[i] = m_meshCenter + (m_vertices[i] - m_meshCenter) * m_scale +
+      m_vertexNormals[i] * m_padding;
+
+  m_boundingBox.setScale(m_scale, m_scale, m_scale);
+  m_boundingBox.setPadding(m_padding, m_padding, m_padding);
 }
 void ConvexMesh::updateInternalData()
 {
+  // The hull scales about its centroid, so the box around it moves as well as grows.
   tf2::Transform pose = m_pose;
-  pose.setOrigin(m_pose * m_boxOffset);
+  pose.setOrigin(m_pose * (m_meshCenter + (m_boxOffset - m_meshCenter) * m_scale));
   m_boundingBox.setPose(pose);
-  // Could apply uniform scale/padding if desired, left as-is for example
-  m_iPose   = m_pose.inverse();
-  m_center  = m_pose * m_meshCenter;
-  m_radiusB = m_meshRadiusB; 
+  m_iPose      = m_pose.inverse();
+  m_center     = m_pose * m_meshCenter;
+  m_radiusB    = m_meshRadiusB * m_scale + m_padding;
   m_radiusBSqr = m_radiusB * m_radiusB;
-
-  m_scaledVertices.resize(m_vertices.size());
-  for (size_t i=0; i<m_vertices.size(); i++)
-  {
-    // Uniform scaling placeholder
-    m_scaledVertices[i] = m_vertices[i];
-  }
 }
 bool ConvexMesh::isPointInsidePlanes(const tf2::Vector3 &point) const
 {
-  for (auto &plane : m_planes)
+  for (auto &plane : m_scaledPlanes)
   {
     double dist = plane(0)*point.x() + plane(1)*point.y() + plane(2)*point.z() + plane(3);
     if (dist > 0.0) return false;

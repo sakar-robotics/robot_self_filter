@@ -114,6 +114,17 @@ static shapes::Shape* constructShape(const urdf::Geometry *geom)
               "Mesh resource is too large for the STL loader: %zu bytes", res.size);
         }
       }
+      // <mesh scale> is part of the geometry, e.g. 0.001 for a mesh modelled in millimetres.
+      if (result)
+      {
+        auto *loaded = static_cast<shapes::Mesh*>(result);
+        for (unsigned int i = 0; i < loaded->vertexCount; ++i)
+        {
+          loaded->vertices[3 * i]     *= mesh->scale.x;
+          loaded->vertices[3 * i + 1] *= mesh->scale.y;
+          loaded->vertices[3 * i + 2] *= mesh->scale.z;
+        }
+      }
       break;
     }
     default:
@@ -128,13 +139,16 @@ class SelfMask
 protected:
   struct SeeLink
   {
-    SeeLink() : body(nullptr), unscaledBody(nullptr), volume(0.0), shadow(true) {}
+    SeeLink() : body(nullptr), unscaledBody(nullptr), volume(0.0), shadow(true), posed(false) {}
     std::string      name;
     bodies::Body    *body;
     bodies::Body    *unscaledBody;
     tf2::Transform   constTransf;
     double           volume;
     bool             shadow;
+    // Until its first transform arrives a body sits at the cloud frame's origin - on top of the
+    // sensor, where its shadow would swallow every ray - so it takes no part in the mask.
+    bool             posed;
   };
 
   struct SortBodies
@@ -226,13 +240,15 @@ public:
   void assumeFrame(const std_msgs::msg::Header &header)
   {
     rclcpp::Time transform_time(header.stamp.sec, header.stamp.nanosec, node_->get_clock()->get_clock_type());
+    // Waited for once per cloud, not once per body: when one transform is missing the rest
+    // usually are too (joint_states stalled), and waiting for each would stall the cloud N times.
+    rclcpp::Duration timeout(std::chrono::milliseconds(100));
     for (auto &sl : bodies_)
     {
       try
       {
         auto transform_stamped = tf_buffer_.lookupTransform(
-          header.frame_id, sl.name,
-          transform_time, rclcpp::Duration(std::chrono::milliseconds(100)));
+          header.frame_id, sl.name, transform_time, timeout);
         tf2::Quaternion q(
             transform_stamped.transform.rotation.x,
             transform_stamped.transform.rotation.y,
@@ -246,10 +262,16 @@ public:
         tf2::Transform tf2_transform(q, t);
         sl.body->setPose(tf2_transform * sl.constTransf);
         sl.unscaledBody->setPose(tf2_transform * sl.constTransf);
+        sl.posed = true;
       }
-      catch(...)
+      catch (const std::exception &ex)
       {
         // keep old pose
+        timeout = rclcpp::Duration(0, 0);
+        RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 5000,
+          "Self-filter link '%s' %s: %s", sl.name.c_str(),
+          sl.posed ? "keeps its last pose" : "is not filtered until its transform arrives",
+          ex.what());
       }
     }
     computeBoundingSpheres();
@@ -300,7 +322,7 @@ public:
   {
     for (auto &sl : bodies_)
     {
-      if (sl.body->containsPoint(pt))
+      if (sl.posed && sl.body->containsPoint(pt))
         return INSIDE;
     }
     return OUTSIDE;
@@ -310,7 +332,7 @@ public:
                           const std::function<void(const tf2::Vector3&)> &intersectionCallback = nullptr) const
   {
     for (auto &sl : bodies_)
-      if (sl.unscaledBody->containsPoint(pt))
+      if (sl.posed && sl.unscaledBody->containsPoint(pt))
         return INSIDE;
 
     tf2::Vector3 dir = sensor_pos_ - pt;
@@ -320,7 +342,7 @@ public:
     dir /= lng;
     for (auto &sl : bodies_)
     {
-      if (!sl.shadow) continue;
+      if (!sl.shadow || !sl.posed) continue;
       std::vector<tf2::Vector3> hits;
       if (sl.body->intersectsRay(pt, dir, &hits, 1))
       {
@@ -335,7 +357,7 @@ public:
 
     for (auto &sl : bodies_)
     {
-      if (sl.body->containsPoint(pt))
+      if (sl.posed && sl.body->containsPoint(pt))
         return INSIDE;
     }
     return OUTSIDE;
@@ -416,7 +438,13 @@ protected:
       for (auto &coll : collisions)
       {
         shapes::Shape *shape = constructShape(coll->geometry.get());
-        if (!shape) continue;
+        if (!shape)
+        {
+          RCLCPP_WARN(node_->get_logger(),
+            "Self-filter link '%s' has collision geometry that could not be loaded",
+            urdf_link_name.c_str());
+          continue;
+        }
 
         SeeLink sl;
         sl.name       = linfo.name;
@@ -477,7 +505,10 @@ protected:
             }
             case shapes::MESH:
             {
-              // Mesh scaling and padding are not currently configurable.
+              // single scale/padding, like a sphere or the box/cylinder fallback
+              auto mesh = dynamic_cast<bodies::ConvexMesh*>(sl.body);
+              mesh->setScale(linfo.scale);
+              mesh->setPadding(linfo.padding);
               break;
             }
             default:
@@ -534,7 +565,8 @@ protected:
         {
           const double body_distance2 =
             (pt - bspheres_[body_index].center).length2();
-          if (body_distance2 < bspheresRadius2_[body_index] &&
+          if (bodies_[body_index].posed &&
+              body_distance2 < bspheresRadius2_[body_index] &&
               bodies_[body_index].body->containsPoint(pt))
           {
             out = INSIDE;
@@ -569,7 +601,8 @@ protected:
         {
           const double body_distance2 =
             (pt - unscaledBspheres_[body_index].center).length2();
-          if (body_distance2 < unscaledBspheresRadius2_[body_index] &&
+          if (bodies_[body_index].posed &&
+              body_distance2 < unscaledBspheresRadius2_[body_index] &&
               bodies_[body_index].unscaledBody->containsPoint(pt))
           {
             out = INSIDE;
@@ -592,7 +625,7 @@ protected:
           // Ray intersect
           for (auto &sl : bodies_)
           {
-            if (!sl.shadow) continue;
+            if (!sl.shadow || !sl.posed) continue;
             hits.clear();
             if (sl.body->intersectsRay(pt, dir, &hits, 1))
             {
@@ -611,7 +644,8 @@ protected:
             {
               const double body_distance2 =
                 (pt - bspheres_[body_index].center).length2();
-              if (body_distance2 < bspheresRadius2_[body_index] &&
+              if (bodies_[body_index].posed &&
+                  body_distance2 < bspheresRadius2_[body_index] &&
                   bodies_[body_index].body->containsPoint(pt))
               {
                 out = INSIDE;
